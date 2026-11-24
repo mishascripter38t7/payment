@@ -1,0 +1,110 @@
+name: Check Donatello Payments
+
+on:
+  schedule:
+    - cron: "*/2 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check-donations:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install mcrcon
+        run: pip install mcrcon
+
+      - name: Process Donatello donations and send RCON
+        env:
+          DONATELLO_TOKEN: ${{ secrets.DONATELLO_TOKEN }}
+          RCON_HOST: ${{ secrets.RCON_HOST }}
+          RCON_PORT: ${{ secrets.RCON_PORT }}
+          RCON_PASSWORD: ${{ secrets.RCON_PASSWORD }}
+        run: |
+          python - <<'EOF'
+          import json
+          import os
+          import re
+          import urllib.request
+          from mcrcon import MCRcon
+
+          token = os.environ["DONATELLO_TOKEN"].strip()
+          rcon_host = os.environ["RCON_HOST"].strip()
+          rcon_port = int(os.environ["RCON_PORT"].strip())
+          rcon_pass = os.environ["RCON_PASSWORD"].strip()
+
+          req = urllib.request.Request(
+              "https://donatello.to/api/v1/donations",
+              headers={"X-Token": token, "User-Agent": "Mozilla/5.0"}
+          )
+
+          with urllib.request.urlopen(req, timeout=15) as resp:
+              data = json.loads(resp.read().decode("utf-8"))
+
+          items = data if isinstance(data, list) else data.get("content") or data.get("data") or []
+
+          state_file = "processed_donations.json"
+          if os.path.exists(state_file):
+              with open(state_file, "r", encoding="utf-8") as f:
+                  processed = set(json.load(f))
+          else:
+              processed = set()
+
+          # Сумма в гривнах -> имя команды (/team) на сервере
+          tiers = {
+              50: "vip",
+              120: "mvp",
+              250: "legend",
+          }
+
+          new_processed = False
+          for d in items:
+              don_id = str(d.get("id") or d.get("pubId") or "")
+              if not don_id or don_id in processed:
+                  continue
+
+              amount_raw = d.get("amount") or d.get("sum") or 0
+              try:
+                  amount = int(float(amount_raw))
+              except ValueError:
+                  amount = 0
+
+              raw_msg = str(d.get("message") or d.get("comment") or d.get("clientName") or "").strip()
+              match = re.search(r"[A-Za-z0-9_]{3,16}", raw_msg)
+              nick = match.group(0) if match else ""
+              role = tiers.get(amount)
+
+              if nick and role:
+                  cmd = f"team join {role} {nick}"
+                  with MCRcon(rcon_host, rcon_pass, port=rcon_port) as mcr:
+                      res = mcr.command(cmd)
+                  print(f"SENT: {cmd} | RESPONSE: {res}")
+              else:
+                  print(f"SKIPPED: id={don_id}, amount={amount}, raw='{raw_msg}'")
+
+              processed.add(don_id)
+              new_processed = True
+
+          if new_processed:
+              with open(state_file, "w", encoding="utf-8") as f:
+                  json.dump(sorted(processed), f, indent=2)
+          EOF
+
+      - name: Save processed IDs
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add processed_donations.json
+            git commit -m "chore: update processed Donatello donations"
+            git push
+          fi
